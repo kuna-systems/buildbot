@@ -20,8 +20,12 @@ from twisted.web import html
 from twisted.web.util import DeferredResource
 from twisted.web.util import Redirect
 
+import base64
+import hmac
+import os
 import time
 import urllib
+import hashlib
 
 from buildbot import interfaces
 from buildbot import util
@@ -39,6 +43,72 @@ from buildbot.status.web.base import path_to_slave
 from buildbot.status.web.step import StepsResource
 from buildbot.status.web.tests import TestsResource
 from twisted.python import log
+
+
+class SecureS3(object):
+    def __init__(self, identifier=None, secret_identifier=None,
+                       aws_id_file_path=None):
+        # Get AWS identifier and secret_identifier (from ~/.ec2/aws_id)
+        if identifier is None:
+            assert secret_identifier is None, (
+                'supply both or neither of identifier, secret_identifier')
+            if aws_id_file_path is None:
+                home = os.environ['HOME']
+                aws_id_file_path = os.path.join(home, '.ec2', 'aws_id')
+            if not os.path.exists(aws_id_file_path):
+                raise ValueError(
+                    "Please supply your AWS access key identifier and secret "
+                    "access key identifier either when instantiating this %s "
+                    "or in the %s file (on two lines).\n" %
+                    (self.__class__.__name__, aws_id_file_path))
+            with open(aws_id_file_path, 'r') as aws_file:
+                identifier = aws_file.readline().strip()
+                secret_identifier = aws_file.readline().strip()
+        else:
+            assert aws_id_file_path is None, \
+                'if you supply the identifier and secret_identifier, ' \
+                'do not specify the aws_id_file_path'
+            assert secret_identifier is not None, \
+                'supply both or neither of identifier, secret_identifier'
+        self.key = identifier
+        self.secret_key = secret_identifier
+
+    def gen_signature(self, string_to_sign):
+        return base64.encodestring(
+            hmac.new(
+                self.secret_key,
+                string_to_sign,
+                hashlib.sha1
+            ).digest()
+        ).strip()
+
+    def get_auth_link(self, bucket, filename, expires=3600, timestamp=None):
+        ''' Return a secure S3 link with an expiration on the download.
+
+            bucket: Bucket name
+            filename: file path
+            expires: Seconds from NOW the link expires
+            timestamp: Epoch timestamp. If present, "expires" will not be used.
+        '''
+        filename = urllib.quote_plus(filename)
+        filename = filename.replace('%2F', '/')
+        path = '/%s/%s' % (bucket, filename)
+
+        if timestamp is not None:
+            expire_time = float(timestamp)
+        else:
+            expire_time = time.time() + expires
+
+        expire_str = '%.0f' % (expire_time)
+        string_to_sign = u'GET\n\n\n%s\n%s' % (expire_str, path)
+        params = {
+            'AWSAccessKeyId': self.key,
+            'Expires': expire_str,
+            'Signature': self.gen_signature(string_to_sign.encode('utf-8')),
+        }
+
+        return 'http://%s.s3.amazonaws.com/%s?%s' % (
+                                    bucket, filename, urllib.urlencode(params))
 
 
 def _get_comments_from_request(req):
@@ -160,6 +230,7 @@ class StatusResourceBuild(HtmlResource):
     def __init__(self, build_status):
         HtmlResource.__init__(self)
         self.build_status = build_status
+        self.s3 = SecureS3()
 
     def getPageTitle(self, request):
         return ("Buildbot: %s Build #%d" %
@@ -233,7 +304,7 @@ class StatusResourceBuild(HtmlResource):
             step['link'] = req.childLink("steps/%s" %
                                          urllib.quote(s.getName(), safe=''))
             step['text'] = " ".join([str(txt) for txt in s.getText()])
-            step['urls'] = map(lambda x: dict(url=x[1], logname=x[0]), s.getURLs().items())
+            step['urls'] = map(lambda x: dict(url=self.s3.get_auth_link('kunasystems-buildbot', x[1]), logname=x[0]), s.getURLs().items())
 
             step['logs'] = []
             for l in s.getLogs():
