@@ -242,11 +242,12 @@ class GitPoller(base.PollingChangeSource, StateMixin):
 
         lastRev = self.lastRev.get(branch)
         self.lastRev[branch] = newRev
-        if not lastRev:
-            return
 
         # get the change list
-        revListArgs = [r'--format=%H', '%s..%s' % (lastRev, newRev), '--']
+        if lastRev:
+            revListArgs = [r'--format=%H', '%s..%s' % (lastRev, newRev), '--']
+        else:
+            revListArgs = [r'--format=%H', '%s' % (newRev), '--']
         self.changeCount = 0
         results = yield self._dovccmd('log', revListArgs, path=self.workdir)
 
